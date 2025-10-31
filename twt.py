@@ -4,6 +4,7 @@ import smtplib
 from email.mime.text import MIMEText
 from flask import Flask, request
 from dotenv import load_dotenv
+from anthropic import Anthropic
 
 load_dotenv()
 
@@ -12,6 +13,7 @@ app = Flask(__name__)
 # Global variables to store monitoring parameters for filtering
 MONITOR_HANDLE = None
 MONITOR_KEYWORD = None
+MONITOR_PROMPT = None
 
 API_BASE = "https://api.twitterapi.io/oapi/tweet_filter"
 API_HEADERS = {'Content-Type': 'application/json'}
@@ -58,13 +60,14 @@ def update_rule(api_key, rule_id, tag, value, interval_seconds=100, is_effect=1)
         return None
     return resp.json()
 
-def monitor_twitter(handle=None, keyword=None):
+def monitor_twitter(handle=None, keyword=None, prompt=None):
     """Create or reuse a monitoring rule (idempotent)"""
-    global MONITOR_HANDLE, MONITOR_KEYWORD
+    global MONITOR_HANDLE, MONITOR_KEYWORD, MONITOR_PROMPT
 
     # Store monitoring parameters for webhook filtering
     MONITOR_HANDLE = handle.lstrip('@') if handle else None
     MONITOR_KEYWORD = keyword.lower() if keyword else None
+    MONITOR_PROMPT = prompt
 
     api_key = os.getenv('TWITTER_API_KEY')
     if not api_key:
@@ -100,6 +103,39 @@ def monitor_twitter(handle=None, keyword=None):
         update_rule(api_key, rule_id, rule_tag, rule_value, interval_seconds=100, is_effect=1)
     else:
         print("Could not create rule.")
+
+def check_tweet_relevance(tweet_text, prompt):
+    """Use Claude to determine if a tweet matches the specified prompt"""
+    api_key = os.getenv('ANTHROPIC_API_KEY')
+    if not api_key:
+        print("ANTHROPIC_API_KEY missing, skipping LLM filtering")
+        return True  # Default to including tweet if no API key
+
+    try:
+        client = Anthropic(api_key=api_key)
+
+        # Create a focused prompt for Claude to analyze the tweet
+        analysis_prompt = f"""Analyze this tweet and determine if it matches the following criteria:
+
+Criteria: {prompt}
+
+Tweet: {tweet_text}
+
+Respond with only "YES" if the tweet matches the criteria, or "NO" if it doesn't. Be strict in your evaluation."""
+
+        response = client.messages.create(
+            model="claude-3-haiku-20240307",  # Using Haiku for speed and cost efficiency
+            max_tokens=10,
+            messages=[{"role": "user", "content": analysis_prompt}]
+        )
+
+        # Check if the response indicates a match
+        result = response.content[0].text.strip().upper()
+        return result == "YES"
+
+    except Exception as e:
+        print(f"Error using Claude API: {e}")
+        return True  # Default to including tweet if error occurs
 
 def send_email(subject, body):
     smtp_server = os.getenv('SMTP_SERVER', 'smtp.gmail.com')
@@ -143,7 +179,8 @@ def webhook():
     for tweet in tweets:
         # Extract tweet data
         author_username = tweet.get('author', {}).get('userName', '').lower()
-        tweet_text = tweet.get('text', '').lower()
+        tweet_text = tweet.get('text', '')  # Keep original case for LLM analysis
+        tweet_text_lower = tweet_text.lower()  # For keyword matching
         tweet_url = tweet.get('url', '')
 
         # Check if tweet matches our monitoring criteria
@@ -154,8 +191,16 @@ def webhook():
             matches = False
 
         # Filter by keyword if specified
-        if MONITOR_KEYWORD and MONITOR_KEYWORD not in tweet_text:
+        if MONITOR_KEYWORD and MONITOR_KEYWORD not in tweet_text_lower:
             matches = False
+
+        # If we have a prompt, use Claude to check relevance (additional filter after keyword)
+        if matches and MONITOR_PROMPT:
+            matches = check_tweet_relevance(tweet_text, MONITOR_PROMPT)
+            if matches:
+                print(f"Claude determined tweet matches prompt: {tweet_url}")
+            else:
+                print(f"Claude determined tweet doesn't match prompt: {tweet_url}")
 
         # Add matching tweet URL
         if matches and tweet_url:
@@ -177,11 +222,11 @@ if __name__ == "__main__":
     # Only create rule when we're in the reloader child process (WERKZEUG_RUN_MAIN is set).
     # If you prefer, you can instead use app.run(..., use_reloader=False)
     if os.environ.get("WERKZEUG_RUN_MAIN") == "true" or os.environ.get("FLASK_RUN_FROM_CLI") == "true":
-        monitor_twitter(handle='a_gov12', keyword='test')
+        monitor_twitter(keyword='test', prompt='ensure that the post does not contain any negative words or phrases')
     else:
         # If not set, still create once (covers running without debug)
         if not app.debug:
-            monitor_twitter(handle='a_gov12', keyword='test')
+            monitor_twitter(keyword='test', prompt='ensure that the post does not contain any negative words or phrases')
 
     print("\nStarting webhook server on http://localhost:5000")
     app.run(port=5000, debug=True)  # or use debug=True, use_reloader=False
