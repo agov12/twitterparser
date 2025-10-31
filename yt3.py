@@ -5,6 +5,9 @@ import xml.etree.ElementTree as ET
 from flask import Flask, request, Response
 from typing import Dict, Optional
 from dotenv import load_dotenv
+from datetime import datetime, timedelta, timezone
+import threading
+import time
 
 # Load environment variables from .env file
 load_dotenv()
@@ -31,6 +34,31 @@ def save_subscriptions(data: dict) -> None:
 
 # Store active subscriptions (loaded from disk)
 active_subscriptions = load_subscriptions()
+
+# Store seen videos for keyword polling
+SEEN_VIDEOS_FILE = "seen_videos.json"
+seen_videos = set()
+
+def load_seen_videos():
+    global seen_videos
+    try:
+        with open(SEEN_VIDEOS_FILE, "r") as f:
+            seen_videos = set(json.load(f))
+    except Exception:
+        seen_videos = set()
+
+def save_seen_videos():
+    try:
+        with open(SEEN_VIDEOS_FILE, "w") as f:
+            json.dump(list(seen_videos), f)
+    except Exception:
+        pass
+
+# Load seen videos on startup
+load_seen_videos()
+
+# Global flag for stopping polling
+stop_polling = False
 
 
 def get_channel_id_from_handle(handle: str) -> Optional[str]:
@@ -189,6 +217,118 @@ def unsubscribe_from_youtube_channel(channel_identifier: str, callback_url: str)
         return False
 
 
+def poll_youtube_for_keyword(keyword: str):
+    """
+    Poll YouTube API for new videos matching a keyword.
+    """
+    global seen_videos, stop_polling
+
+    youtube_api_key = os.getenv('YOUTUBE_API_KEY')
+    if not youtube_api_key:
+        print("Error: YOUTUBE_API_KEY environment variable not set")
+        return
+
+    print(f"🔍 Starting to poll YouTube for keyword: '{keyword}'")
+    print("Press Ctrl+C to stop polling")
+
+    while not stop_polling:
+        try:
+            # Calculate publishedAfter (1 minute ago)
+            # one_minute_ago = (datetime.now(timezone.utc) - timedelta(minutes=1)).isoformat()
+
+            seconds_20 = (datetime.now(timezone.utc) - timedelta(seconds=20)).isoformat()
+
+            # Search for videos
+            search_url = "https://www.googleapis.com/youtube/v3/search"
+            search_params = {
+                'part': 'snippet',
+                'q': keyword,
+                'type': 'video',
+                'order': 'date',
+                'publishedAfter': seconds_20,
+                'maxResults': 10,
+                'key': youtube_api_key
+            }
+
+            response = requests.get(search_url, params=search_params)
+            response.raise_for_status()
+            data = response.json()
+
+            for item in data.get('items', []):
+                video_id = item['id']['videoId']
+
+                # Skip if we've already seen this video
+                if video_id in seen_videos:
+                    continue
+
+                # Mark as seen
+                seen_videos.add(video_id)
+                save_seen_videos()
+
+                video_title = item['snippet']['title']
+                channel_title = item['snippet']['channelTitle']
+                published_at = item['snippet']['publishedAt']
+
+                print(f"\n🔔 New video matching '{keyword}': {video_title}")
+                print(f"   Channel: {channel_title}")
+                print(f"   Published: {published_at}")
+                print(f"   URL: https://www.youtube.com/watch?v={video_id}")
+                # Trigger notification here
+
+            # Wait for 1 minute before next poll
+            print(".", end="", flush=True)
+            time.sleep(20)
+
+        except KeyboardInterrupt:
+            print("\n\n⛔ Stopping keyword polling...")
+            stop_polling = True
+            break
+        except Exception as e:
+            print(f"\n⚠️  Error polling YouTube: {str(e)[:100]}")
+            time.sleep(20)  # Wait before retrying
+
+
+def setup_youtube_notifications(handle: str = None, keyword: str = None, callback_url: str = None):
+    """
+    Unified function to set up YouTube notifications based on provided parameters.
+
+    Args:
+        handle: Optional YouTube channel handle
+        keyword: Optional keyword to filter for
+        callback_url: Optional webhook URL (required if handle is provided)
+
+    Behavior:
+        - If only handle: Subscribe to channel for all videos
+        - If only keyword: Poll all of YouTube for keyword
+        - If both: Subscribe to channel and filter by keyword
+        - If neither: Raise error
+    """
+    if not handle and not keyword:
+        raise ValueError("Error: At least one of handle or keyword must be provided")
+
+    if handle and keyword:
+        # Subscribe to specific channel with keyword filtering
+        print(f"📺 Setting up: Channel '{handle}' + keyword '{keyword}'")
+        if not callback_url:
+            print("❌ Callback URL required for channel subscription")
+            return {'success': False, 'error': 'Callback URL required'}
+        return subscribe_to_youtube_channel(handle, callback_url, keyword)
+
+    elif handle:
+        # Subscribe to specific channel for all videos
+        print(f"📺 Setting up: Channel '{handle}' (all videos)")
+        if not callback_url:
+            print("❌ Callback URL required for channel subscription")
+            return {'success': False, 'error': 'Callback URL required'}
+        return subscribe_to_youtube_channel(handle, callback_url, None)
+
+    else:  # Only keyword
+        # Poll all of YouTube for keyword
+        print(f"🔍 Setting up: Keyword '{keyword}' (all channels)")
+        poll_youtube_for_keyword(keyword)
+        return {'success': True, 'message': 'Started polling'}
+
+
 def subscribe_to_youtube_channel(handle: str, callback_url: str, keyword: str = None):
     """
     Subscribe to a YouTube channel for new video notifications with optional keyword filtering.
@@ -275,31 +415,43 @@ if __name__ == "__main__":
     # Test subscription
     # Set environment variables in .env file:
 
-    print("YouTube Channel Subscription Setup")
-    print("1. Subscribe to channel")
+    print("YouTube Notification Setup")
+    print("1. Set up notifications")
     print("2. Run webhook server")
     print("3. Unsubscribe from channel")
 
     choice = input("Enter choice (1, 2, or 3): ")
 
     if choice == "1":
-        handle = input("Enter YouTube channel handle (e.g., '@MrBeast' or 'MrBeast'): ")
-        callback_url = "https://uncarted-bev-nonpathologically.ngrok-free.dev/youtube-webhook"
-        keyword = input("Enter keyword to filter videos (or press Enter to skip): ")
+        # Always ask for both, allow skipping either
+        handle = input("Enter YouTube channel handle (or press Enter to skip): ").strip()
+        keyword = input("Enter keyword to search for (or press Enter to skip): ").strip()
 
-        print(f"\n⚠️  Make sure the webhook server is running (option 2) before subscribing!")
-        print(f"Callback URL: {callback_url}")
+        # Convert empty strings to None
+        handle = handle if handle else None
+        keyword = keyword if keyword else None
 
-        result = subscribe_to_youtube_channel(handle, callback_url, keyword if keyword else None)
+        try:
+            # Determine callback URL if needed
+            callback_url = None
+            if handle:
+                callback_url = "https://uncarted-bev-nonpathologically.ngrok-free.dev/youtube-webhook"
+                print(f"\n⚠️  Make sure the webhook server is running (option 2) before subscribing!")
+                print(f"Callback URL: {callback_url}")
 
-        if result['success']:
-            print(f"\n✅ Successfully subscribed!")
-            print(f"   Channel ID: {result['channel_id']}")
-            print(f"   Callback URL: {result['callback_url']}")
-            if result['keyword']:
-                print(f"   Filtering for keyword: {result['keyword']}")
-        else:
-            print(f"\n❌ Failed to subscribe: {result['error']}")
+            result = setup_youtube_notifications(handle, keyword, callback_url)
+
+            if result and result.get('success'):
+                print("\n✅ Successfully set up notifications!")
+                if handle:
+                    print(f"   Channel ID: {result.get('channel_id', 'N/A')}")
+                if keyword:
+                    print(f"   Keyword: {keyword}")
+            elif result:
+                print(f"\n❌ Failed: {result.get('error', 'Unknown error')}")
+
+        except ValueError as e:
+            print(f"\n❌ {str(e)}")
 
     elif choice == "2":
         print("\nStarting webhook server on port 5000...")
